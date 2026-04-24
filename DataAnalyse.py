@@ -48,29 +48,37 @@ print("Top słowa w Legit:", get_top_words(df[df['EmailLabel'] == 0]['EmailText'
 vectorizer = TfidfVectorizer(max_features=5000)
 tfidf_matrix = vectorizer.fit_transform(df['EmailText'])
 
-sample_size = min(40000, len(df))
-sim_matrix = cosine_similarity(tfidf_matrix[:sample_size], tfidf_matrix[:sample_size])
-rows, cols = np.where((sim_matrix > 0.9) & (sim_matrix < 0.99))
-
+batch_size = 2000
+num_rows = tfidf_matrix.shape[0]
+indices_to_drop = set()
 displayed_count = 0
 max_examples = 80000
-indices_to_drop = set()
-for r, c in zip(rows, cols):
-    if r < c:
-        indices_to_drop.add(c)
-        similarity_score = sim_matrix[r, c]
 
-        # print(f"\nPara nr {displayed_count + 1} | Podobieństwo: {similarity_score:.4f}")
-        # print(f"Indeks {r} (Zostaje): {df.iloc[r]['EmailText']}")
-        # print(f"Indeks {c} (Do usunięcia): {df.iloc[c]['EmailText']}")
-        # print("-" * 50)
+for i in range(0, num_rows, batch_size):
+    end_i = min(i + batch_size, num_rows)
+    chunk = tfidf_matrix[i:end_i]
 
-        displayed_count += 1
-        if displayed_count >= max_examples:
-            break
+    sim_matrix = cosine_similarity(chunk, tfidf_matrix)
 
+    rows, cols = np.where((sim_matrix > 0.9) & (sim_matrix < 0.99))
 
-print(f"Do usunięcia {len(indices_to_drop)} bliskich duplikatów.")
+    for r, c in zip(rows, cols):
+        actual_r = r + i
+        if actual_r < c:
+            indices_to_drop.add(c)
+            displayed_count += 1
+            similarity_score = sim_matrix[r, c]
+
+            # print(f"\nPara nr {displayed_count} | Podobieństwo: {similarity_score:.4f}")
+            # print(f"Indeks {actual_r} (Zostaje): {df.iloc[actual_r]['EmailText']}")
+            # print(f"Indeks {c} (Do usunięcia): {df.iloc[c]['EmailText']}")
+            # print("-" * 50)
+            if displayed_count >= max_examples:
+                break
+    if displayed_count >= max_examples:
+        break
+
+print(f"Gotowe. Masz {len(indices_to_drop)} indeksów do wywalenia.")
 
 df.drop(index=df.index[list(indices_to_drop)], inplace=True)
 df.drop_duplicates(subset=['EmailText'], inplace=True)
