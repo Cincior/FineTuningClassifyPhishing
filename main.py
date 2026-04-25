@@ -1,4 +1,6 @@
-from transformers import AutoTokenizer, Trainer, TrainingArguments, AutoModelForSequenceClassification, TrainerCallback
+import matplotlib.pyplot as plt
+import seaborn as sns
+from transformers import AutoTokenizer, Trainer, TrainingArguments, AutoModelForSequenceClassification
 from datasets import load_dataset, Dataset
 import torch
 import torch.nn.functional as F
@@ -60,9 +62,6 @@ def apply_sliding_window(dataset_split, tokenizer_p):
     return Dataset.from_list(new_data)
 
 
-# =========================
-# MAIN PART
-# =========================
 if os.path.exists(save_path):
     tokenizer = AutoTokenizer.from_pretrained(save_path)
     model = AutoModelForSequenceClassification.from_pretrained(save_path)
@@ -73,11 +72,7 @@ else:
 
     dataset = load_dataset("csv", data_files="phishingEmail.csv")
 
-    # =========================
-    # CZYSZCZENIE DANYCH
-    # =========================
     df = dataset["train"].to_pandas()
-
     df.rename(columns={"Email Text": "EmailText", "Email Type": "EmailLabel"}, inplace=True)
     df.dropna(subset=["EmailText", "EmailLabel"], inplace=True)
     df["EmailLabel"] = df["EmailLabel"].astype(int)
@@ -97,11 +92,8 @@ else:
     for i in range(0, num_rows, batch_size):
         end_i = min(i + batch_size, num_rows)
         chunk = tfidf_matrix[i:end_i]
-
         sim_matrix = cosine_similarity(chunk, tfidf_matrix)
-
         rows, cols = np.where(sim_matrix > 0.9)
-
         for r, c in zip(rows, cols):
             actual_r = r + i
             if actual_r < c:
@@ -109,15 +101,12 @@ else:
 
     df.drop(index=list(indices_to_drop), inplace=True)
     df.dropna(subset=["EmailText", "EmailLabel"], inplace=True)
-
     df["EmailText"] = df["EmailText"].apply(clean_email)
 
     print("Po czyszczeniu:")
     print(df["EmailLabel"].value_counts())
 
-    # powrót do datasetu HF
     dataset = Dataset.from_pandas(df, preserve_index=False)
-
     train_test_split = dataset.train_test_split(test_size=0.2, shuffle=True, seed=SEED)
     test_valid_split = train_test_split["test"].train_test_split(test_size=0.5, shuffle=True, seed=SEED)
 
@@ -148,7 +137,6 @@ else:
     )
 
     metrics_callback = EpochMetricsCallback()
-
     trainer = Trainer(
         model=model,
         args=training_args,
@@ -168,8 +156,18 @@ else:
     predictions = trainer.predict(test_ds)
     y_true = predictions.label_ids
     y_pred = np.argmax(predictions.predictions, axis=1)
+
     print("\n=== CONFUSION MATRIX (TEST SET) ===")
-    print(confusion_matrix(y_true, y_pred))
+    cm = confusion_matrix(y_true, y_pred)
+    print(cm)
+
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=['Normal', 'Phishing'],
+                yticklabels=['Normal', 'Phishing'])
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.title('Confusion Matrix')
+    plt.tight_layout()
+    plt.savefig('confusion_matrix.png')
 
     plot_epoch_metrics(metrics_callback.epoch_metrics)
 
@@ -193,7 +191,6 @@ def predict_proba(texts):
         inputs = {k: v.to(device) for k, v in inputs.items() if k != "overflow_to_sample_mapping"}
         with torch.no_grad():
             outputs = model(**inputs)
-
         probs = F.softmax(outputs.logits, dim=1).cpu().numpy()
         avg_probs = np.mean(probs, axis=0)
         all_probs.append(avg_probs)
@@ -220,22 +217,17 @@ def get_suspicious_fragments(text, lime_words):
 def explain_prediction(text):
     cleaned = clean_email(text)
     probs = predict_proba([cleaned])[0]
-
     print("\n" + "=" * 30)
     print("TEXT:", text[:100], "...")
     print(f"Normal: {round(probs[0] * 100, 2)}% | Phishing: {round(probs[1] * 100, 2)}%")
-
     exp = explainer.explain_instance(cleaned, predict_proba, num_features=5, num_samples=500)
-
     suspicious_words = [(word, score) for word, score in exp.as_list() if score > 0]
-
     print("\nSuspicious words:")
     if not suspicious_words:
         print("None found.")
     else:
         for word, score in suspicious_words:
             print(f"[ {word} ] -> {round(score, 3)}")
-
 
 # =========================
 # TEST

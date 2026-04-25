@@ -22,6 +22,7 @@ plt.show()
 print('Empty mails: ', df['EmailText'].isna().sum())
 print('Empty labels: ', df['EmailLabel'].isna().sum())
 
+
 def get_top_words(text_series, n=20):
     words = " ".join(text_series.astype(str)).lower().split()
     return Counter(words).most_common(n)
