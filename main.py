@@ -10,10 +10,12 @@ import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+import pandas as pd
 
 model_name = "distilbert-base-uncased"
 save_path = "./saved_modelT"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+SEED = 42
 
 
 def compute_metrics(eval_pred):
@@ -35,10 +37,16 @@ class EpochMetricsCallback(TrainerCallback):
         self.epoch_metrics = []
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        train_loss = None
+        for entry in reversed(state.log_history):
+            if "loss" in entry and "eval_loss" not in entry:
+                train_loss = entry["loss"]
+                break
+
         if metrics is not None:
             self.epoch_metrics.append({
                 "epoch": state.epoch,
-                "train_loss": state.log_history[-1].get("loss", None) if state.log_history else None,
+                "train_loss": train_loss,
                 "val_loss": metrics.get("eval_loss", None),
                 "accuracy": metrics.get("eval_accuracy", None),
                 "f1": metrics.get("eval_f1", None),
@@ -81,7 +89,34 @@ def plot_epoch_metrics(epoch_metrics):
     plt.show()
 
 
-# =========================
+def clean_email(text):
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    words = text.split()
+    cleaned_words = [w for w in words if w not in ENGLISH_STOP_WORDS]
+    result = " ".join(cleaned_words)
+    return re.sub(r'\s+', ' ', result).strip()
+
+
+def apply_sliding_window(dataset_split, tokenizer_p):
+    new_data = []
+    for example in dataset_split:
+        tokenized = tokenizer_p(
+            example["EmailText"],
+            truncation=True,
+            padding="max_length",
+            max_length=512,
+            stride=64,
+            return_overflowing_tokens=True
+        )
+        num_chunks = len(tokenized["input_ids"])
+        for i in range(num_chunks):
+            new_data.append({
+                "input_ids": tokenized["input_ids"][i],
+                "attention_mask": tokenized["attention_mask"][i],
+                "labels": int(example["EmailLabel"])
+            })
+    return Dataset.from_list(new_data)
 
 
 if os.path.exists(save_path):
@@ -119,6 +154,8 @@ else:
     # usuwanie duplikatów
     df.drop_duplicates(subset=["EmailText"], inplace=True)
 
+    df.reset_index(drop=True, inplace=True)
+
     # USUWANIE PODOBNYCH (COS)
     vectorizer = TfidfVectorizer(max_features=5000)
     tfidf_matrix = vectorizer.fit_transform(df["EmailText"])
@@ -140,57 +177,46 @@ else:
             if actual_r < c:
                 indices_to_drop.add(c)
 
-    df.drop(index=df.index[list(indices_to_drop)], inplace=True)
+    df.drop(index=list(indices_to_drop), inplace=True)
 
     # finalne czyszczenie
     df.dropna(subset=["EmailText", "EmailLabel"], inplace=True)
+
+    df["EmailText"] = df["EmailText"].apply(clean_email)
 
     print("Po czyszczeniu:")
     print(df["EmailLabel"].value_counts())
 
     # powrót do datasetu HF
-    dataset = Dataset.from_pandas(df)
+    dataset = Dataset.from_pandas(df, preserve_index=False)
 
-    new_data = []
+    train_test_split = dataset.train_test_split(test_size=0.2, shuffle=True, seed=SEED)
+    test_valid_split = train_test_split["test"].train_test_split(test_size=0.5, shuffle=True, seed=SEED)
 
-    for example in dataset:
-        tokenized = tokenizer(
-            example["EmailText"],
-            truncation=True,
-            padding="max_length",
-            max_length=512,
-            stride=64,
-            return_overflowing_tokens=True
-        )
+    train_ds = apply_sliding_window(train_test_split["train"], tokenizer)
+    val_ds = apply_sliding_window(test_valid_split["train"], tokenizer)
+    test_ds = apply_sliding_window(test_valid_split["test"], tokenizer)
 
-        num_chunks = len(tokenized["input_ids"])
-
-        for i in range(num_chunks):
-            new_data.append({
-                "input_ids": tokenized["input_ids"][i],
-                "attention_mask": tokenized["attention_mask"][i],
-                "labels": int(example["EmailLabel"])
-            })
-
-    # NOWY DATASET
-    dataset = Dataset.from_list(new_data)
-
-    train_test_split = dataset.train_test_split(test_size=0.2, shuffle=True)
-    test_valid_split = train_test_split["test"].train_test_split(test_size=0.5, shuffle=True)
-
-    train_ds = train_test_split["train"]
-    val_ds = test_valid_split["train"]
-    test_ds = test_valid_split["test"]
+    train_labels = pd.Series([x["labels"] for x in train_ds])
+    val_labels = pd.Series([x["labels"] for x in val_ds])
+    test_labels = pd.Series([x["labels"] for x in test_ds])
+    print("\n=== CLASS BALANCE PO SLIDING WINDOW ===")
+    print("Train:\n", train_labels.value_counts())
+    print("Val:\n", val_labels.value_counts())
+    print("Test:\n", test_labels.value_counts())
 
     training_args = TrainingArguments(
         output_dir="./results",
-        num_train_epochs=3,
+        num_train_epochs=4,
         per_device_train_batch_size=16,
         logging_steps=10,
         save_total_limit=1,
         eval_strategy="epoch",
         save_strategy="epoch",
-        load_best_model_at_end=True
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
+        greater_is_better=True,
+        seed=SEED
     )
 
     metrics_callback = EpochMetricsCallback()
@@ -234,7 +260,7 @@ def predict_proba(texts):
             truncation=True,
             padding=True,
             max_length=512,
-            stride=128,
+            stride=64,
             return_overflowing_tokens=True
         )
         inputs = {k: v.to(device) for k, v in inputs.items() if k != "overflow_to_sample_mapping"}
@@ -263,47 +289,49 @@ def get_suspicious_fragments(text, lime_words):
                     fragments.append((fragment, score))
     return fragments
 
-
 def explain_prediction(text):
-    probs = predict_proba([text])[0]
+    cleaned = clean_email(text)
+    probs = predict_proba([cleaned])[0]
+
     print("\n" + "=" * 30)
     print("TEXT:", text[:100], "...")
     print(f"Normal: {round(probs[0] * 100, 2)}% | Phishing: {round(probs[1] * 100, 2)}%")
-    exp = explainer.explain_instance(text, predict_proba, num_features=5, num_samples=500)
-    fragments = get_suspicious_fragments(text, exp.as_list())
-    print("\nSuspicious fragments:")
-    for frag, score in fragments:
-        print(f"[ {frag} ] -> {round(score, 3)}")
 
+    exp = explainer.explain_instance(cleaned, predict_proba, num_features=5, num_samples=500)
+
+    suspicious_words = [(word, score) for word, score in exp.as_list() if score > 0]
+
+    print("\nSuspicious words:")
+    if not suspicious_words:
+        print("None found.")
+    else:
+        for word, score in suspicious_words:
+            print(f"[ {word} ] -> {round(score, 3)}")
 
 # =========================
 # TEST
 # =========================
-def clean_email(text):
-    text = text.lower()
-    text = re.sub(r'[^a-z0-9\s]', '', text)
-
-    words = text.split()
-    cleaned_words = [w for w in words if w not in ENGLISH_STOP_WORDS]
-
-    result = " ".join(cleaned_words)
-    return re.sub(r'\s+', ' ', result).strip()
-
-
-explain_prediction(clean_email("Dear Customer,    We detected an unusual sign-in attempt on your account from a new device and "
+explain_prediction("Dear Customer,    We detected an unusual sign-in attempt on your account from a new device and "
                    "location. For your security, your account has been temporarily limited. Please confirm your "
                    "identity and restore full access by clicking the secure link below: Verify My Account Now → "
                    "http://security-check-account.com/verify If you do not verify your account within 24 hours, "
-                   "your account will be permanently suspended. Thank you for your cooperation, Security Team"))
+                   "your account will be permanently suspended. Thank you for your cooperation, Security Team")
 explain_prediction(
-    clean_email("URGENT: Your PayPal account has been suspended. Please log in at http://secure-paypal-login.com to verify your identity immediately."))
+    "URGENT: Your PayPal account has been suspended. Please log in at http://secure-paypal-login.com to verify your identity immediately.")
 explain_prediction(
-    clean_email("Congratulations! You've been selected to receive a $1000 Walmart Gift Card. Click here to claim your reward!"))
+    "Congratulations! You've been selected to receive a $1000 Walmart Gift Card. Click here to claim your reward!")
 explain_prediction(
-    clean_email("Invoice INV-99283 is overdue. Please download the attached PDF to avoid late fees and legal action."))
+    "Invoice INV-99283 is overdue. Please download the attached PDF to avoid late fees and legal action.")
 explain_prediction(
-    clean_email("Dear Customer, we noticed suspicious activity on your credit card. Confirm your details now to prevent card blocking: http://bit.ly/bank-secure-auth"))
+    "Dear Customer, we noticed suspicious activity on your credit card. Confirm your details now to prevent card blocking: http://bit.ly/bank-secure-auth")
 explain_prediction(
-    clean_email("I am a lawyer representing a deceased relative who left you $10.5M. Please reply with your bank details to initiate the transfer."))
+    "I am a lawyer representing a deceased relative who left you $10.5M. Please reply with your bank details to initiate the transfer.")
 explain_prediction(
-    clean_email("Hi team, are we still meeting at 3 PM in the conference room? Let me know if we need to reschedule."))
+    "Hi Laura how you doing. You paid for me last time so let me tak you for a dinner today. cant wait!")
+explain_prediction(
+    "Hi Claire, Thank you for your recent purchase. We are confirming that your order has been received and is being "
+    "processed. You will receive a tracking number once the shipment is sent out. Please let us know if you have any "
+    "questions. Best, Amy Johnson Customer Support Agent Online Store X")
+explain_prediction(
+    "I hope this email finds you well. I am checking on the status of the invoice I sent last week. Have you "
+    "processed the payment? Best regards, Tom McNish Content Manager ABC Company")

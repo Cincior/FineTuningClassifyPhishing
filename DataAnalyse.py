@@ -38,6 +38,8 @@ df['EmailText'] = df['EmailText'].apply(lambda x: re.sub(r'_+', ' ', x))
 df['EmailText'] = df['EmailText'].apply(lambda x: re.sub(r'\s+', ' ', x))
 df.drop_duplicates(subset=['EmailText'], inplace=True)
 
+df.reset_index(drop=True, inplace=True)
+
 print('Duplikaty maili: ', df['EmailText'].duplicated().sum())
 
 print("Max długość maila:", df['EmailText'].str.len().max())
@@ -74,7 +76,7 @@ for i in range(0, num_rows, batch_size):
 
 print(f"Gotowe. Masz {len(indices_to_drop)} indeksów do usuniecia.")
 
-df.drop(index=df.index[list(indices_to_drop)], inplace=True)
+df.drop(index=list(indices_to_drop), inplace=True)
 df.dropna(subset=['EmailText', 'EmailLabel'], inplace=True)
 
 print("\n--- STAN KOŃCOWY ---")
