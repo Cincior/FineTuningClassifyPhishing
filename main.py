@@ -11,6 +11,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 import pandas as pd
+from EpochMetricsCallback import *
 
 model_name = "distilbert-base-uncased"
 save_path = "./saved_modelT"
@@ -27,66 +28,6 @@ def compute_metrics(eval_pred):
         "recall": recall_score(labels, preds, zero_division=0),
         "f1": f1_score(labels, preds, zero_division=0)
     }
-
-
-# =========================
-# CALLBACK: ZAPIS METRYK CO EPOKĘ
-# =========================
-class EpochMetricsCallback(TrainerCallback):
-    def __init__(self):
-        self.epoch_metrics = []
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        train_loss = None
-        for entry in reversed(state.log_history):
-            if "loss" in entry and "eval_loss" not in entry:
-                train_loss = entry["loss"]
-                break
-
-        if metrics is not None:
-            self.epoch_metrics.append({
-                "epoch": state.epoch,
-                "train_loss": train_loss,
-                "val_loss": metrics.get("eval_loss", None),
-                "accuracy": metrics.get("eval_accuracy", None),
-                "f1": metrics.get("eval_f1", None),
-                "precision": metrics.get("eval_precision", None),
-                "recall": metrics.get("eval_recall", None),
-            })
-
-
-def plot_epoch_metrics(epoch_metrics):
-    import matplotlib.pyplot as plt
-
-    epochs = [m["epoch"] for m in epoch_metrics]
-    train_loss = [m["train_loss"] for m in epoch_metrics]
-    val_loss = [m["val_loss"] for m in epoch_metrics]
-    accuracy = [m["accuracy"] for m in epoch_metrics]
-    f1 = [m["f1"] for m in epoch_metrics]
-    precision = [m["precision"] for m in epoch_metrics]
-    recall = [m["recall"] for m in epoch_metrics]
-
-    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
-    fig.suptitle("Metryki treningowe — co epokę", fontsize=14)
-
-    def _plot(ax, y, label, color):
-        ax.plot(epochs, y, marker="o", color=color, linewidth=2)
-        ax.set_title(label)
-        ax.set_xlabel("Epoka")
-        ax.set_xticks(epochs)
-        ax.grid(True, linestyle="--", alpha=0.5)
-
-    _plot(axes[0, 0], train_loss, "Training Loss", "#E55A2B")
-    _plot(axes[0, 1], val_loss, "Validation Loss", "#2B7BE5")
-    _plot(axes[0, 2], accuracy, "Accuracy", "#27A06A")
-    _plot(axes[1, 0], f1, "F1", "#9B59B6")
-    _plot(axes[1, 1], precision, "Precision", "#E5A82B")
-    _plot(axes[1, 2], recall, "Recall", "#E52B6A")
-
-    plt.tight_layout()
-    plt.savefig("epoch_metrics.png", dpi=150)
-    print("\nWykres zapisany jako epoch_metrics.png")
-    plt.show()
 
 
 def clean_email(text):
@@ -119,6 +60,9 @@ def apply_sliding_window(dataset_split, tokenizer_p):
     return Dataset.from_list(new_data)
 
 
+# =========================
+# MAIN PART
+# =========================
 if os.path.exists(save_path):
     tokenizer = AutoTokenizer.from_pretrained(save_path)
     model = AutoModelForSequenceClassification.from_pretrained(save_path)
@@ -135,28 +79,14 @@ else:
     df = dataset["train"].to_pandas()
 
     df.rename(columns={"Email Text": "EmailText", "Email Type": "EmailLabel"}, inplace=True)
-
-    # usuwanie pustych
     df.dropna(subset=["EmailText", "EmailLabel"], inplace=True)
-
-    # rzutowanie etykiety
     df["EmailLabel"] = df["EmailLabel"].astype(int)
-
-    # strip
     df["EmailText"] = df["EmailText"].astype(str).str.strip()
-
-    # usuwanie '_'
     df["EmailText"] = df["EmailText"].apply(lambda x: re.sub(r"_+", " ", x))
-
-    # usuwanie wielu spacji
     df["EmailText"] = df["EmailText"].apply(lambda x: re.sub(r"\s+", " ", x))
-
-    # usuwanie duplikatów
     df.drop_duplicates(subset=["EmailText"], inplace=True)
-
     df.reset_index(drop=True, inplace=True)
 
-    # USUWANIE PODOBNYCH (COS)
     vectorizer = TfidfVectorizer(max_features=5000)
     tfidf_matrix = vectorizer.fit_transform(df["EmailText"])
 
@@ -178,8 +108,6 @@ else:
                 indices_to_drop.add(c)
 
     df.drop(index=list(indices_to_drop), inplace=True)
-
-    # finalne czyszczenie
     df.dropna(subset=["EmailText", "EmailLabel"], inplace=True)
 
     df["EmailText"] = df["EmailText"].apply(clean_email)
@@ -243,7 +171,6 @@ else:
     print("\n=== CONFUSION MATRIX (TEST SET) ===")
     print(confusion_matrix(y_true, y_pred))
 
-    # WYKRES METRYK
     plot_epoch_metrics(metrics_callback.epoch_metrics)
 
     model.save_pretrained(save_path)
@@ -289,6 +216,7 @@ def get_suspicious_fragments(text, lime_words):
                     fragments.append((fragment, score))
     return fragments
 
+
 def explain_prediction(text):
     cleaned = clean_email(text)
     probs = predict_proba([cleaned])[0]
@@ -308,14 +236,16 @@ def explain_prediction(text):
         for word, score in suspicious_words:
             print(f"[ {word} ] -> {round(score, 3)}")
 
+
 # =========================
 # TEST
 # =========================
-explain_prediction("Dear Customer,    We detected an unusual sign-in attempt on your account from a new device and "
-                   "location. For your security, your account has been temporarily limited. Please confirm your "
-                   "identity and restore full access by clicking the secure link below: Verify My Account Now → "
-                   "http://security-check-account.com/verify If you do not verify your account within 24 hours, "
-                   "your account will be permanently suspended. Thank you for your cooperation, Security Team")
+explain_prediction(
+    "Dear Customer enron,    We detected an unusual sign-in attempt on your account from a new device and "
+    "location. For your security, your account has been temporarily limited. Please confirm your "
+    "identity and restore full access by clicking the secure link below: Verify My Account Now → "
+    "http://security-check-account.com/verify If you do not verify your account within 24 hours, "
+    "your account will be permanently suspended. Thank you for your cooperation, Security Team")
 explain_prediction(
     "URGENT: Your PayPal account has been suspended. Please log in at http://secure-paypal-login.com to verify your identity immediately.")
 explain_prediction(
